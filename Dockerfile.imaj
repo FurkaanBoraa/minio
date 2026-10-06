@@ -1,0 +1,99 @@
+# NextStage için MinIO imajı: Furkan'ın forkundan (github.com/FurkaanBoraa/minio)
+# KAYNAKTAN derlenir. Neden kendi Dockerfile'ımız: forkun Dockerfile.release'i
+# ikiliyi dl.min.io'dan indirir (25 Eyl 2026'dan beri 410 Gone), kökteki Dockerfile
+# ise minio/minio:latest tabanına dayanır (artık çekilemez). Bu dosya aynı taban
+# imajı (ubi9 micro), aynı giriş betiğini, aynı ortam değişkenlerini kullanır;
+# yalnız ikili forkun kaynak ağacından derlenir.
+#
+# Derleme bağlamı: MinIO kaynak ağacı (etiketin checkout'u). Bu dosya `-f` ile
+# `imaj` dalından verilir. Derleme aşaması derleyen makinenin mimarisinde koşar
+# (BUILDPLATFORM), hedef mimari için çapraz derler (Go bunu kendisi yapar).
+
+FROM --platform=$BUILDPLATFORM golang:1.24-alpine AS derle
+
+ARG TARGETOS
+ARG TARGETARCH
+# RELEASE: MinIO yayın etiketi (RELEASE.2025-09-07T16-13-09Z gibi).
+# COMMIT: etiketin işaret ettiği commit (sürüm satırına yazılır).
+ARG RELEASE
+ARG COMMIT
+
+ENV GOPATH=/go
+ENV CGO_ENABLED=0
+
+RUN apk add -U --no-cache ca-certificates curl
+
+WORKDIR /kaynak
+COPY . .
+
+# Sürüm bilgisi forkun Makefile'ının yaptığı gibi ldflags ile gömülür
+# (buildscripts/gen-ldflags.go): `minio --version` yayın etiketini ve commit'i
+# yazar, güncelleme denetimi de bu alanlardan okur. Derleme bayrakları
+# Makefile'daki `build` hedefiyle aynı: -tags kqueue -trimpath.
+RUN set -eu; \
+    test -n "$RELEASE"; test -n "$COMMIT"; \
+    surum=$(printf '%s' "$RELEASE" | sed -e 's/^RELEASE\.//' \
+        -e 's/^\([0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}T[0-9]\{2\}\)-\([0-9]\{2\}\)-\([0-9]\{2\}Z\)$/\1:\2:\3/'); \
+    yil=$(printf '%s' "$surum" | cut -c1-4); \
+    kisa=$(printf '%s' "$COMMIT" | cut -c1-12); \
+    ld="-s -w"; \
+    ld="$ld -X github.com/minio/minio/cmd.Version=$surum"; \
+    ld="$ld -X github.com/minio/minio/cmd.CopyrightYear=$yil"; \
+    ld="$ld -X github.com/minio/minio/cmd.ReleaseTag=$RELEASE"; \
+    ld="$ld -X github.com/minio/minio/cmd.CommitID=$COMMIT"; \
+    ld="$ld -X github.com/minio/minio/cmd.ShortCommitID=$kisa"; \
+    GOOS="$TARGETOS" GOARCH="$TARGETARCH" \
+        go build -tags kqueue -trimpath -ldflags "$ld" -o /go/bin/minio . ; \
+    test -s /go/bin/minio
+
+# Statik curl: compose sağlık denetimi konteynerin İÇİNDEN curl ile bakar
+# (`curl -fsS http://localhost:9000/minio/health/live`), ubi micro'da curl yok.
+# Forkun kendi imajı da aynı kaynağı kullanır (dockerscripts/download-static-curl.sh),
+# yalnız `latest` yerine burada sürüm sabit: eski imajdaki curl 8.11.0 idi.
+RUN set -eu; \
+    case "$TARGETARCH" in arm64) mimari=aarch64 ;; *) mimari="$TARGETARCH" ;; esac; \
+    curl -fsSL "https://github.com/moparisthebest/static-curl/releases/download/v8.11.0/curl-$mimari" -o /go/bin/curl; \
+    chmod +x /go/bin/curl
+
+FROM registry.access.redhat.com/ubi9/ubi-micro:9.6
+
+ARG RELEASE
+ARG COMMIT
+
+LABEL name="MinIO" \
+      vendor="MinIO Inc <dev@min.io>" \
+      maintainer="MinIO Inc <dev@min.io>" \
+      version="${RELEASE}" \
+      release="${RELEASE}" \
+      summary="MinIO is a High Performance Object Storage, API compatible with Amazon S3 cloud storage service." \
+      description="MinIO object storage, NextStage icin FurkaanBoraa/minio forkundan kaynaktan derlendi." \
+      org.opencontainers.image.source="https://github.com/FurkaanBoraa/minio" \
+      org.opencontainers.image.version="${RELEASE}" \
+      org.opencontainers.image.revision="${COMMIT}" \
+      org.opencontainers.image.licenses="AGPL-3.0-only"
+
+# Eski imajla birebir aynı ortam (docker image inspect ile okundu, 6 Eki 2026).
+ENV MINIO_ACCESS_KEY_FILE=access_key \
+    MINIO_SECRET_KEY_FILE=secret_key \
+    MINIO_ROOT_USER_FILE=access_key \
+    MINIO_ROOT_PASSWORD_FILE=secret_key \
+    MINIO_KMS_SECRET_KEY_FILE=kms_master_key \
+    MINIO_UPDATE_MINISIGN_PUBKEY="RWTx5Zr1tiHQLwG9keckT0c45M3AGeHD6IvimQHpyRywVWGbP1aVSGav" \
+    MINIO_CONFIG_ENV_FILE=config.env \
+    MC_CONFIG_DIR=/tmp/.mc
+
+RUN chmod -R 777 /usr/bin
+
+COPY --from=derle /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+COPY --from=derle /go/bin/minio /usr/bin/minio
+COPY --from=derle /go/bin/curl /usr/bin/curl
+
+COPY CREDITS /licenses/CREDITS
+COPY LICENSE /licenses/LICENSE
+COPY dockerscripts/docker-entrypoint.sh /usr/bin/docker-entrypoint.sh
+
+EXPOSE 9000
+VOLUME ["/data"]
+
+ENTRYPOINT ["/usr/bin/docker-entrypoint.sh"]
+CMD ["minio"]

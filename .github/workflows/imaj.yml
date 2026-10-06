@@ -1,0 +1,101 @@
+# MinIO imajını forkun kaynak ağacından derleyip GHCR'a basar:
+#   ghcr.io/furkaanboraa/minio:<etiket>
+# NextStage'in compose dosyaları imajı buradan çeker (NextStage K-148).
+#
+# Neden: MinIO'nun açık kaynak deposu arşivlendi (25 Eyl 2026), minio/minio
+# imajı hiçbir kayıt defterinden çekilemiyor. Bu dal (`imaj`) yalnız bu iş
+# akışını ve Dockerfile.imaj'ı taşır; MinIO kaynağı etiketten checkout edilir,
+# master'a dokunulmaz.
+#
+# Tetik: bu dala push (varsayılan etiketi derler) ya da elle çalıştırma
+# (etiket ve beklenen commit girilir). Etiket beklenen commit'e çözülmezse
+# derleme durur: etiket yer değiştirirse farkında olmadan başka kod basılmasın.
+name: MinIO imajı (forktan GHCR'a)
+
+on:
+  push:
+    branches: [imaj]
+  workflow_dispatch:
+    inputs:
+      etiket:
+        description: "MinIO yayın etiketi (fork'ta var olmalı)"
+        required: true
+        default: "RELEASE.2025-09-07T16-13-09Z"
+      commit:
+        description: "Etiketin beklenen commit'i (tam sha); boş bırakılırsa doğrulanmaz"
+        required: false
+        default: "07c3a429bfed433e49018cb0f78a52145d4bedeb"
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  ETIKET: ${{ inputs.etiket || 'RELEASE.2025-09-07T16-13-09Z' }}
+  BEKLENEN_COMMIT: ${{ inputs.commit || '07c3a429bfed433e49018cb0f78a52145d4bedeb' }}
+  IMAJ: ghcr.io/furkaanboraa/minio
+
+jobs:
+  derle-ve-bas:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Bu dal (Dockerfile.imaj)
+        uses: actions/checkout@v5
+
+      - name: MinIO kaynağı (etiket)
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ env.ETIKET }}
+          path: kaynak
+          fetch-depth: 1
+
+      - name: Etiketi commit'e karşı doğrula
+        id: dogrula
+        run: |
+          sha=$(git -C kaynak rev-parse HEAD)
+          echo "etiket $ETIKET -> $sha"
+          if [ -n "$BEKLENEN_COMMIT" ] && [ "$sha" != "$BEKLENEN_COMMIT" ]; then
+            echo "HATA: etiket beklenen commit'e çözülmedi (beklenen $BEKLENEN_COMMIT)" >&2
+            exit 1
+          fi
+          echo "commit=$sha" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: GHCR girişi
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derle ve bas (amd64 + arm64)
+        uses: docker/build-push-action@v6
+        with:
+          context: kaynak
+          file: Dockerfile.imaj
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: false
+          tags: ${{ env.IMAJ }}:${{ env.ETIKET }}
+          build-args: |
+            RELEASE=${{ env.ETIKET }}
+            COMMIT=${{ steps.dogrula.outputs.commit }}
+
+      - name: Basılan imajı çek ve sına (sürüm satırı, sağlık ucu)
+        run: |
+          set -eu
+          docker pull "$IMAJ:$ETIKET"
+          docker run --rm "$IMAJ:$ETIKET" minio --version
+          docker run -d --name sinama -e MINIO_ROOT_USER=sinama -e MINIO_ROOT_PASSWORD=sinama-gizli \
+            "$IMAJ:$ETIKET" server /data --console-address ":9001"
+          for i in $(seq 1 30); do
+            docker exec sinama curl -fsS http://localhost:9000/minio/health/live && break
+            sleep 1
+          done
+          docker exec sinama curl -fsS http://localhost:9000/minio/health/live
+          docker logs sinama | head -20
+          docker rm -f sinama
+          docker image inspect "$IMAJ:$ETIKET" --format 'boyut={{.Size}} mimari={{.Architecture}} surum={{index .Config.Labels "version"}}'
